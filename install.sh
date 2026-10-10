@@ -59,6 +59,19 @@ readonly TS="$(date +%s)"
 log() { printf '[%s] %s\n' "$PROG" "$*" >&2; }
 die() { log "ERROR: $*"; exit 1; }
 
+# Refuse to replace a sudoers file unless it is exactly one rule written by
+# this installer or the user-admin tools. A matching line alone is not enough.
+managed_sudoers_file() {
+  local file=$1 user=$2 rule
+  sudo test -f "$file" && ! sudo test -L "$file" || return 1
+  for rule in "$user ALL=(ALL) ALL" "$user ALL=(ALL) NOPASSWD: ALL"; do
+    if sudo cat -- "$file" | cmp -s - <(printf '%s\n' "$rule"); then
+      return 0
+    fi
+  done
+  return 1
+}
+
 DRY_RUN=0
 ENABLE=1
 KEEP_AUTOLOGIN=0
@@ -109,6 +122,21 @@ if [[ -n "$ADD_USER" ]]; then
     [[ -n "$g" ]] || die "empty group name in --groups '$USER_GROUPS'"
     getent group "$g" >/dev/null || die "unknown group: $g (check with 'getent group <name>')"
   done
+fi
+
+# Check before changing the theme or account so an unrelated sudoers file
+# cannot turn a combined install into a partial update.
+if [[ -n "$ADD_USER" ]]; then
+  sudoers_file="/etc/sudoers.d/$ADD_USER"
+  if sudo test -e "$sudoers_file" || sudo test -L "$sudoers_file"; then
+    if ! id "$ADD_USER" &>/dev/null; then
+      die "$sudoers_file already exists and would apply to the new account. Inspect it with 'sudo visudo -f $sudoers_file' and remove it before creating $ADD_USER"
+    fi
+    if (( GRANT_SUDO || GRANT_SUDO_NOPASSWD )); then
+      managed_sudoers_file "$sudoers_file" "$ADD_USER" ||
+        die "$sudoers_file is not exactly one managed rule for $ADD_USER. Inspect it with 'sudo visudo -f $sudoers_file'; omit --sudo/--sudo-nopasswd to install without changing sudo"
+    fi
+  fi
 fi
 
 for f in Main.qml metadata.desktop theme.conf; do
@@ -218,6 +246,10 @@ if [[ -n "$ADD_USER" ]]; then
 
   if [[ $GRANT_SUDO -eq 1 || $GRANT_SUDO_NOPASSWD -eq 1 ]]; then
     sudoers_file="/etc/sudoers.d/$ADD_USER"
+    if sudo test -e "$sudoers_file" || sudo test -L "$sudoers_file"; then
+      managed_sudoers_file "$sudoers_file" "$ADD_USER" ||
+        die "$sudoers_file changed or is not managed. Inspect it with 'sudo visudo -f $sudoers_file' before retrying"
+    fi
     if [[ $GRANT_SUDO_NOPASSWD -eq 1 ]]; then
       sudoers_line="$ADD_USER ALL=(ALL) NOPASSWD: ALL"
     else

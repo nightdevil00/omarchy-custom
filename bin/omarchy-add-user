@@ -93,7 +93,8 @@ while (( $# > 0 )); do
     echo
     echo "Creates a login user, puts it in the given groups (default: none),"
     echo "sets its password via passwd, and optionally grants sudo through a"
-    echo "validated /etc/sudoers.d/<username> drop-in."
+    echo "validated /etc/sudoers.d/<username> drop-in. Refuses to create the"
+    echo "user while a sudoers drop-in with that name already exists."
     echo
     echo "The wheel group makes the user an administrator: wheel members can"
     echo "become root through polkit (pkexec, run0) with their own password,"
@@ -123,6 +124,13 @@ if [[ -z $USERNAME ]]; then
 fi
 valid_username "$USERNAME" || fail "invalid username '$USERNAME' (lowercase letters, digits, _ or -)"
 id "$USERNAME" &>/dev/null && fail "user '$USERNAME' already exists (see omarchy-change-groups)"
+
+# Any drop-in already under this name is stale: it would hand the new account
+# sudo, or be overwritten below. Stop before creating anything.
+sudoers_file="/etc/sudoers.d/$USERNAME"
+if sudo test -e "$sudoers_file" || sudo test -L "$sudoers_file"; then
+  fail "$sudoers_file already exists and would apply to the new account. Inspect it with 'sudo visudo -f $sudoers_file' and remove it before creating $USERNAME"
+fi
 
 # No groups is the default: a plain desktop user needs none.
 if (( ! GROUPS_GIVEN )) && interactive; then
@@ -184,7 +192,6 @@ else
 fi
 
 if [[ $SUDO_ARG == "sudo" || $SUDO_ARG == "sudo-nopasswd" ]]; then
-  sudoers_file="/etc/sudoers.d/$USERNAME"
   if [[ $SUDO_ARG == "sudo-nopasswd" ]]; then
     sudoers_line="$USERNAME ALL=(ALL) NOPASSWD: ALL"
   else

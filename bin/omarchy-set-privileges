@@ -1,13 +1,14 @@
 #!/bin/bash
 
 # omarchy:summary=Set a user's sudo level: password, passwordless, or none
-# omarchy:args=[username] [--level password|nopasswd|none] [--yes]
+# omarchy:args=[username] [--level password|nopasswd|none] [--yes] [--force-lockout]
 # omarchy:examples=omarchy-set-privileges | omarchy-set-privileges alice --level nopasswd --yes
 
 set -euo pipefail
 
 PROG="omarchy-set-privileges"
 ASSUME_YES=0
+FORCE_LOCKOUT=0
 USERNAME=""
 LEVEL=""
 
@@ -47,6 +48,40 @@ login_users() {
   getent passwd | awk -F: '$3 >= 1000 && $3 < 60000 { print $1 }' | sort
 }
 
+# A managed file contains exactly one of the rules this tool writes, including
+# its final newline. Do not mistake a matching line in a larger file for ours.
+managed_sudoers_file() {
+  local file=$1 user=$2 rule
+  sudo test -f "$file" && ! sudo test -L "$file" || return 1
+  for rule in "$user ALL=(ALL) ALL" "$user ALL=(ALL) NOPASSWD: ALL"; do
+    if sudo cat -- "$file" | cmp -s - <(printf '%s\n' "$rule"); then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Only an unrestricted rule such as "(ALL) ALL" or "(ALL : ALL) NOPASSWD: ALL"
+# counts; a grant limited to some commands does not make an administrator.
+full_sudo_grant() {
+  local list
+  list=$(LC_ALL=C sudo -l -U "$1" 2>/dev/null) || return 1
+  grep -Eq '^[[:space:]]*\((ALL|root)([[:space:]]*:[^)]*)?\)[[:space:]]+([A-Z]+:[[:space:]]*)*ALL[[:space:]]*$' <<<"$list"
+}
+
+# Another login user counts as an administrator through wheel or an
+# unrestricted sudo grant.
+other_admin_exists() {
+  local candidate groups
+  while IFS= read -r candidate; do
+    [[ $candidate != "$USERNAME" ]] || continue
+    groups=$(id -nG "$candidate") || groups=""
+    [[ " $groups " == *" wheel "* ]] && return 0
+    full_sudo_grant "$candidate" && return 0
+  done < <(login_users)
+  return 1
+}
+
 while (( $# > 0 )); do
   case "$1" in
   --level)
@@ -58,13 +93,21 @@ while (( $# > 0 )); do
     ASSUME_YES=1
     shift
     ;;
+  --force-lockout)
+    FORCE_LOCKOUT=1
+    shift
+    ;;
   -h | --help)
-    echo "Usage: $PROG [username] [--level password|nopasswd|none] [--yes]"
+    echo "Usage: $PROG [username] [--level password|nopasswd|none] [--yes] [--force-lockout]"
     echo
     echo "Sets a user's sudo level through a validated /etc/sudoers.d/<username>"
     echo "drop-in: password sudo, passwordless sudo, or no sudo grant."
-    echo "'none' removes the drop-in only when it is clearly ours (a rule for"
-    echo "that user); anything else is left alone with a warning."
+    echo "'none' removes only a drop-in containing exactly one managed rule,"
+    echo "then reports whether another sudo rule still grants access, no"
+    echo "sudo access remains, or the check could not be completed."
+    echo "Removing your own sudo, or removing sudo when no other administrator"
+    echo "(wheel member or full sudo grant) would remain, needs --force-lockout,"
+    echo "even with --yes."
     echo
     echo "With no arguments it walks you through each step with gum."
     exit 0
@@ -112,17 +155,37 @@ fi
 sudoers_file="/etc/sudoers.d/$USERNAME"
 
 if [[ $LEVEL == "none" ]]; then
-  if sudo test -f "$sudoers_file"; then
-    if sudo grep -qE "^$USERNAME ALL=" "$sudoers_file"; then
-      echo "About to remove sudo grant $sudoers_file."
-      confirm "Remove sudo for $USERNAME?" || fail "aborted"
-      sudo rm -f -- "$sudoers_file"
-      echo "Sudo removed for $USERNAME."
-    else
-      fail "$sudoers_file is not a rule for $USERNAME - review it manually"
+  if sudo test -e "$sudoers_file" || sudo test -L "$sudoers_file"; then
+    managed_sudoers_file "$sudoers_file" "$USERNAME" ||
+      fail "$sudoers_file is not exactly one managed rule for $USERNAME. Inspect it with 'sudo visudo -f $sudoers_file' before changing this account"
+    if (( ! FORCE_LOCKOUT )); then
+      [[ $USERNAME != "${SUDO_USER:-$(id -un)}" ]] ||
+        fail "refusing to remove your own sudo. Sign in as another administrator, or use --force-lockout only with a recovery path"
+      groups=$(id -nG "$USERNAME") || fail "cannot read groups for $USERNAME"
+      if [[ " $groups " != *" wheel "* ]] && ! other_admin_exists; then
+        fail "no other administrator would remain. Add another login user to wheel first, or use --force-lockout only with a recovery path"
+      fi
     fi
+    echo "About to remove managed sudo grant $sudoers_file."
+    confirm "Remove managed sudo grant for $USERNAME?" || fail "aborted"
+    # Recheck immediately before deletion in case the file changed.
+    managed_sudoers_file "$sudoers_file" "$USERNAME" || fail "$sudoers_file changed; inspect it with 'sudo visudo -f $sudoers_file' before retrying"
+    sudo rm -- "$sudoers_file"
+    echo "Removed managed sudo grant $sudoers_file."
   else
-    echo "$USERNAME has no sudoers drop-in; nothing to remove."
+    echo "$USERNAME has no managed sudoers drop-in; nothing to remove."
+  fi
+  # LC_ALL=C keeps sudo's "not allowed" wording matchable.
+  if sudo_list=$(LC_ALL=C sudo -l -U "$USERNAME" 2>&1); then
+    echo "WARNING: $USERNAME still has effective sudo privileges from another rule." >&2
+    printf '%s\n' "$sudo_list" >&2
+    echo "Next: review /etc/sudoers and /etc/sudoers.d as an administrator, change the other grant with visudo, then run 'sudo -l -U $USERNAME' again." >&2
+  elif [[ $sudo_list == *"is not allowed to run sudo"* ]]; then
+    echo "Confirmed: no sudo access remains for $USERNAME."
+  else
+    echo "Could not verify whether $USERNAME still has sudo access. 'sudo -l -U $USERNAME' reported:" >&2
+    printf '%s\n' "$sudo_list" >&2
+    echo "Next: run 'sudo -l -U $USERNAME' from a root or other administrator session before assuming access was removed." >&2
   fi
   exit 0
 fi
@@ -138,6 +201,11 @@ echo "About to set:"
 echo "  user:  $USERNAME"
 echo "  level: $LEVEL"
 confirm "Grant $LEVEL sudo to $USERNAME?" || fail "aborted"
+
+if sudo test -e "$sudoers_file" || sudo test -L "$sudoers_file"; then
+  managed_sudoers_file "$sudoers_file" "$USERNAME" ||
+    fail "$sudoers_file is not exactly one managed rule for $USERNAME. Inspect it with 'sudo visudo -f $sudoers_file'; this tool will not overwrite it"
+fi
 
 # Validate before installing: a broken drop-in in /etc/sudoers.d can
 # take sudo down for everyone.

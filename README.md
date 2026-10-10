@@ -44,6 +44,8 @@ optionally adds groups and grants sudo. This example creates an administrator:
   `/etc/sudoers.d/<name>`.
 - `--skip-password` — don't touch the password (groups/sudo only).
 - Existing users are kept and just updated (groups re-applied).
+- New users are refused if `/etc/sudoers.d/<name>` already exists, even
+  without a sudo flag; inspect and remove the stale file first.
 
 The script resolves theme sources relative to itself, so it works from any
 clone path. Existing installs are backed up to `/var/backups/omarchy-custom-sddm/`.
@@ -79,7 +81,41 @@ written so they could be proposed upstream:
 ```
 
 Every destructive step confirms (bypass with `--yes`); every sudoers write is
-`visudo -c` validated. Run `--help` on any script for its usage.
+`visudo -c` validated. The tools replace or remove only a drop-in containing
+exactly one rule they recognize. `omarchy-set-privileges --level none` also
+checks effective sudo access afterward: it warns if another rule still grants
+it, confirms when none remains, and says so when it could not verify.
+Removing your own sudo or `wheel` membership, or the last administrator (a
+login user in `wheel` or with an unrestricted sudo grant; a rule limited to
+some commands does not count), needs a separate
+`--force-lockout` flag; `--yes` alone does not bypass that guard. These guards also apply when the user has a managed sudo drop-in. Run `--help` on any script for its usage.
+
+### Handling privilege warnings
+
+- **Sudo still works after `--level none`:** The tool removed only its own
+  drop-in. Run `sudo -l -U <username>` from an administrator session, review
+  `/etc/sudoers` and `/etc/sudoers.d/` for the other grant, and edit its source
+  with `sudo visudo` (or `sudo visudo -f <file>` for a drop-in). Run the check
+  again. Do not assume the user has lost sudo until it reports no grant.
+- **An unfamiliar sudoers file blocks a change:** Inspect the named file with
+  `sudo visudo -f <file>`. Resolve its rules manually before retrying; the
+  tools will not delete or replace rules they do not own. For a theme install,
+  omit `--sudo`/`--sudo-nopasswd` if no sudo change is needed.
+- **`omarchy-remove-user` warns that a sudoers file was left in place:** The
+  file changed while the account was being removed, so the tool did not delete
+  it. The account is gone; inspect the file with `sudo visudo -f <file>` and
+  remove it manually before reusing that login name.
+- **`omarchy-add-user` refuses because a sudoers file already exists:** A
+  drop-in left under that name would give the new account sudo. Inspect it
+  with `sudo visudo -f <file>`, remove it, then create the user.
+- **A lockout guard stops a change:** Add another login user to `wheel` and
+  verify that account can administer the machine, then retry. For your own
+  sudo or `wheel` removal, make the change from that other account. Use
+  `--force-lockout` only when you have a tested recovery path.
+- **The post-removal sudo check reports "Could not verify":** The drop-in was
+  removed, but `sudo -l` failed for another reason (shown in the message). Run
+  `sudo -l -U <username>` from a root shell or another administrator session.
+  A failed check does not prove that access was removed.
 
 ### Walkthrough (screenshots)
 

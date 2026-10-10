@@ -1,13 +1,14 @@
 #!/bin/bash
 
 # omarchy:summary=Change a user's supplementary groups (pick, add, remove, or set)
-# omarchy:args=[username] [--add g1,g2] [--remove g1,g2] [--set g1,g2] [--yes]
+# omarchy:args=[username] [--add g1,g2] [--remove g1,g2] [--set g1,g2] [--yes] [--force-lockout]
 # omarchy:examples=omarchy-change-groups | omarchy-change-groups alice --add docker --yes
 
 set -euo pipefail
 
 PROG="omarchy-change-groups"
 ASSUME_YES=0
+FORCE_LOCKOUT=0
 USERNAME=""
 ADD_ARG=""
 REMOVE_ARG=""
@@ -47,6 +48,27 @@ need_gum() {
 
 login_users() {
   getent passwd | awk -F: '$3 >= 1000 && $3 < 60000 { print $1 }' | sort
+}
+
+# Only an unrestricted rule such as "(ALL) ALL" or "(ALL : ALL) NOPASSWD: ALL"
+# counts; a grant limited to some commands does not make an administrator.
+full_sudo_grant() {
+  local list
+  list=$(LC_ALL=C sudo -l -U "$1" 2>/dev/null) || return 1
+  grep -Eq '^[[:space:]]*\((ALL|root)([[:space:]]*:[^)]*)?\)[[:space:]]+([A-Z]+:[[:space:]]*)*ALL[[:space:]]*$' <<<"$list"
+}
+
+# Another login user counts as an administrator through wheel or an
+# unrestricted sudo grant.
+other_admin_exists() {
+  local candidate groups
+  while IFS= read -r candidate; do
+    [[ $candidate != "$USERNAME" ]] || continue
+    groups=$(id -nG "$candidate") || groups=""
+    [[ " $groups " == *" wheel "* ]] && return 0
+    full_sudo_grant "$candidate" && return 0
+  done < <(login_users)
+  return 1
 }
 
 CURATED_GROUPS="wheel video audio optical storage input scanner network power uucp docker"
@@ -110,14 +132,21 @@ while (( $# > 0 )); do
     ASSUME_YES=1
     shift
     ;;
+  --force-lockout)
+    FORCE_LOCKOUT=1
+    shift
+    ;;
   -h | --help)
-    echo "Usage: $PROG [username] [--add g1,g2] [--remove g1,g2] [--set g1,g2] [--yes]"
+    echo "Usage: $PROG [username] [--add g1,g2] [--remove g1,g2] [--set g1,g2] [--yes] [--force-lockout]"
     echo
     echo "Changes a user's supplementary groups. The primary group is never"
     echo "touched. --add/--remove adjust the current set, --set replaces it."
     echo
     echo "With no group flags it shows a gum checklist preselected with the"
     echo "user's current groups; the checked set becomes the new set."
+    echo "Removing your own wheel membership, or wheel from the last"
+    echo "administrator (wheel member or full sudo grant), needs"
+    echo "--force-lockout, even with --yes or a managed sudo drop-in."
     exit 0
     ;;
   -*)
@@ -182,6 +211,16 @@ echo "  after:  ${final:-<none>}"
 current_csv=$(printf '%s' "$current" | tr ' ' '\n' | awk NF | sort | tr '\n' ',')
 final_csv=$(printf '%s' "$final" | tr ',' '\n' | awk NF | sort | tr '\n' ',')
 [[ "$current_csv" != "$final_csv" ]] || fail "no change - groups already match"
+if [[ " $current " == *" wheel "* && ",$final," != *,wheel,* ]]; then
+  # A drop-in or a successful sudo check cannot prove that access survives
+  # removing wheel: sudo may ignore the file or grant access through wheel.
+  if (( ! FORCE_LOCKOUT )); then
+    [[ $USERNAME != "${SUDO_USER:-$(id -un)}" ]] ||
+      fail "refusing to remove your own wheel membership. Sign in as another administrator, or use --force-lockout only with a recovery path"
+    other_admin_exists ||
+      fail "no other administrator found. Add another login user to wheel first, or use --force-lockout only with a recovery path"
+  fi
+fi
 confirm "Apply this group change?" || fail "aborted"
 
 # -G replaces the supplementary set; the primary group is unaffected.

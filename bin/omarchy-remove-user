@@ -1,13 +1,14 @@
 #!/bin/bash
 
 # omarchy:summary=Remove a login user, optionally its home and sudo grant
-# omarchy:args=[username] [--remove-home|--keep-home] [--yes]
+# omarchy:args=[username] [--remove-home|--keep-home] [--yes] [--force-lockout]
 # omarchy:examples=omarchy-remove-user | omarchy-remove-user alice --remove-home --yes
 
 set -euo pipefail
 
 PROG="omarchy-remove-user"
 ASSUME_YES=0
+FORCE_LOCKOUT=0
 USERNAME=""
 HOME_MODE=""
 
@@ -48,6 +49,38 @@ login_users() {
   getent passwd | awk -F: '$3 >= 1000 && $3 < 60000 { print $1 }' | sort
 }
 
+managed_sudoers_file() {
+  local file=$1 user=$2 rule
+  sudo test -f "$file" && ! sudo test -L "$file" || return 1
+  for rule in "$user ALL=(ALL) ALL" "$user ALL=(ALL) NOPASSWD: ALL"; do
+    if sudo cat -- "$file" | cmp -s - <(printf '%s\n' "$rule"); then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Only an unrestricted rule such as "(ALL) ALL" or "(ALL : ALL) NOPASSWD: ALL"
+# counts; a grant limited to some commands does not make an administrator.
+full_sudo_grant() {
+  local list
+  list=$(LC_ALL=C sudo -l -U "$1" 2>/dev/null) || return 1
+  grep -Eq '^[[:space:]]*\((ALL|root)([[:space:]]*:[^)]*)?\)[[:space:]]+([A-Z]+:[[:space:]]*)*ALL[[:space:]]*$' <<<"$list"
+}
+
+# Another login user counts as an administrator through wheel or an
+# unrestricted sudo grant.
+other_admin_exists() {
+  local candidate groups
+  while IFS= read -r candidate; do
+    [[ $candidate != "$USERNAME" ]] || continue
+    groups=$(id -nG "$candidate") || groups=""
+    [[ " $groups " == *" wheel "* ]] && return 0
+    full_sudo_grant "$candidate" && return 0
+  done < <(login_users)
+  return 1
+}
+
 while (( $# > 0 )); do
   case "$1" in
   --remove-home)
@@ -64,13 +97,19 @@ while (( $# > 0 )); do
     ASSUME_YES=1
     shift
     ;;
+  --force-lockout)
+    FORCE_LOCKOUT=1
+    shift
+    ;;
   -h | --help)
-    echo "Usage: $PROG [username] [--remove-home|--keep-home] [--yes]"
+    echo "Usage: $PROG [username] [--remove-home|--keep-home] [--yes] [--force-lockout]"
     echo
     echo "Removes a login user. Never touches root, system accounts (UID < 1000),"
-    echo "or the account running this script. A managed sudoers drop-in"
-    echo "(/etc/sudoers.d/<username> containing only that user's rule) is"
-    echo "removed too; anything else is left alone with a warning."
+    echo "or the account running this script. A sudoers drop-in is removed only"
+    echo "when it contains exactly one managed rule. An unfamiliar file stops"
+    echo "removal before the account is touched. Removing the last"
+    echo "administrator (wheel member or full sudo grant) needs"
+    echo "--force-lockout."
     echo
     echo "With no arguments it lets you pick the user with gum."
     exit 0
@@ -104,6 +143,19 @@ IFS=: read -r name _ uid gid _ home _ <<<"$entry"
 (( uid >= 1000 && uid < 60000 )) || fail "refusing to remove system account '$USERNAME' (UID $uid)"
 [[ $USERNAME != "${SUDO_USER:-$(whoami)}" ]] || fail "refusing to remove your own account"
 
+sudoers_file="/etc/sudoers.d/$USERNAME"
+if sudo test -e "$sudoers_file" || sudo test -L "$sudoers_file"; then
+  managed_sudoers_file "$sudoers_file" "$USERNAME" ||
+    fail "$sudoers_file is not exactly one managed rule for $USERNAME. Inspect it with 'sudo visudo -f $sudoers_file' before removing the account"
+fi
+
+groups=$(id -nG "$USERNAME") || fail "cannot read groups for $USERNAME"
+if [[ " $groups " == *" wheel "* ]] || sudo -l -U "$USERNAME" >/dev/null 2>&1; then
+  if (( ! FORCE_LOCKOUT )) && ! other_admin_exists; then
+    fail "no other administrator found. Add another login user to wheel first, or use --force-lockout only with a recovery path"
+  fi
+fi
+
 if [[ -z $HOME_MODE ]]; then
   if interactive; then
     need_gum
@@ -123,6 +175,12 @@ echo "  user: $USERNAME (UID $uid)"
 echo "  home: $home ($HOME_MODE)"
 confirm "Remove user $USERNAME? This cannot be undone." || fail "aborted"
 
+# Recheck before userdel so a changed file aborts with the account intact.
+if sudo test -e "$sudoers_file" || sudo test -L "$sudoers_file"; then
+  managed_sudoers_file "$sudoers_file" "$USERNAME" ||
+    fail "$sudoers_file changed; inspect it with 'sudo visudo -f $sudoers_file' before retrying. The account was not removed"
+fi
+
 # Log the user out first so userdel doesn't fail on a live session.
 sudo loginctl terminate-user "$USERNAME" >/dev/null 2>&1 || true
 
@@ -132,14 +190,14 @@ else
   sudo userdel -- "$USERNAME"
 fi
 
-# Drop a sudoers file only when it is clearly ours: a rule for this user.
-sudoers_file="/etc/sudoers.d/$USERNAME"
-if sudo test -f "$sudoers_file"; then
-  if sudo grep -qE "^$USERNAME ALL=" "$sudoers_file"; then
-    sudo rm -f -- "$sudoers_file"
-    echo "Removed sudo grant $sudoers_file."
+# A changed file must never be removed as ours, but the account is already
+# gone, so warn instead of failing.
+if sudo test -e "$sudoers_file" || sudo test -L "$sudoers_file"; then
+  if managed_sudoers_file "$sudoers_file" "$USERNAME"; then
+    sudo rm -- "$sudoers_file"
+    echo "Removed managed sudo grant $sudoers_file."
   else
-    echo "Kept $sudoers_file (not a rule for $USERNAME) - review it manually." >&2
+    echo "WARNING: $sudoers_file changed while the account was being removed and was left in place. Inspect it with 'sudo visudo -f $sudoers_file' before reusing this login name." >&2
   fi
 fi
 
